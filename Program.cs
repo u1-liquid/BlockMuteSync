@@ -1,750 +1,90 @@
 ﻿using System;
-using System.IO;
-using System.Net;
-using System.Security.Cryptography;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using System.Diagnostics;
-using IniParser.Model;
-using IniParser;
+using System.IO;
+using System.Threading;
 using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 
 namespace BlockMuteSync
 {
-    class Program
+    internal class Program
     {
-        public static OAuth oAuth { get; private set; }
         public static string ini_file = "BlockMuteSync.ini";
 
-        static void Main(string[] args)
+        [STAThread]
+        private static void Main()
         {
-            Log.Init();
-            var setting = new INIParser(ini_file);
-            var AuthData = "Authenticate";
-            string consumerKey = setting.GetValue(AuthData, "ConsumerKey");
-            string consumerSecret = setting.GetValue(AuthData, "CconsumerSecret");
-            string accessToken = setting.GetValue(AuthData, "AccessToken");
-            string accessSecret = setting.GetValue(AuthData, "AccessSecret");
-            if (string.IsNullOrWhiteSpace(consumerKey) || string.IsNullOrWhiteSpace(consumerSecret))
+            TwitterApi.Login(new IniSettings(new FileInfo(ini_file)));
+            if (TwitterApi.TwitterOAuth.User.Token == null) return;
+
+            HashSet<string> blocklist = new HashSet<string>();
+            HashSet<string> mutelist = new HashSet<string>();
+
+            Console.WriteLine("Loading login info...");
+            string myId = TwitterApi.getMyId();
+
+            string readLine;
+            if (!string.IsNullOrEmpty(myId))
             {
-                Log.Error("Program", "Unable to get consumerKey / Secret. Please check config file.");
-                if (string.IsNullOrWhiteSpace(consumerKey)) { setting.SetValue(AuthData, "ConsumerKey", ""); }
-                if (string.IsNullOrWhiteSpace(consumerSecret)) { setting.SetValue(AuthData, "CconsumerSecret", ""); }
-                if (string.IsNullOrWhiteSpace(accessToken)) { setting.SetValue(AuthData, "AccessToken", ""); }
-                if (string.IsNullOrWhiteSpace(accessSecret)) { setting.SetValue(AuthData, "AccessSecret", ""); }
-                setting.Save();
-                return;
-            }
-            else if (string.IsNullOrWhiteSpace(accessToken) || string.IsNullOrWhiteSpace(accessSecret))
-            {
-                oAuth = new OAuth(consumerKey, consumerSecret);
-                OAuth.TokenPair tokens = null;
-                tokens = oAuth.RequestToken();
-                oAuth.User.Token = tokens.Token;
-                oAuth.User.Secret = tokens.Token;
-                try
+                UserIdsObject result;
+
+                Console.Write("Do you have backup of blocklist? (Y/N)");
+                readLine = Console.ReadLine();
+                if ((readLine != null) && readLine.ToUpper().Trim().Equals("Y"))
                 {
-                    using (Process.Start(new ProcessStartInfo { UseShellExecute = true, FileName = "https://api.twitter.com/oauth/authorize?oauth_token=" + tokens.Token }))
-                    { }
+                    Console.Write("Enter path of your blocklist\n: ");
+                    string input = Console.ReadLine();
+                    if ((input != null) && File.Exists(input.Replace("\"", "")))
+                        blocklist.UnionWith(File.ReadAllText(input.Replace("\"", "")).Split(','));
                 }
-                catch
-                { }
-
-                string verifier;
-                int i;
-
-                do
+                else
                 {
-                    Console.Write("Please input verifier code : ");
-                    verifier = Console.ReadLine();
-                } while (!int.TryParse(verifier, out i));
-
-                tokens = oAuth.AccessToken(verifier);
-
-                if (tokens != null)
-                {
-                    oAuth.User.Token = tokens.Token;
-                    oAuth.User.Secret = tokens.Token;
-                    accessToken = oAuth.User.Token;
-                    accessSecret = oAuth.User.Secret;
-                    setting.SetValue(AuthData, "AccessToken", tokens.Token);
-                    setting.SetValue(AuthData, "AccessSecret", tokens.Secret);
-                    setting.Save();
+                    Console.WriteLine("Get My Block List... (Max 250000 per 15min)");
+                    result = JsonConvert.DeserializeObject<UserIdsObject>(TwitterApi.getMyBlockList("-1"));
+                    while (result != null)
+                    {
+                        blocklist.UnionWith(result.ids);
+                        if (result.next_cursor != 0)
+                            result = JsonConvert.DeserializeObject<UserIdsObject>(TwitterApi.getMyBlockList(result.next_cursor_str));
+                        else
+                            break;
+                    }
                 }
 
-                setting.Save();
-
-                oAuth = new OAuth(consumerKey, consumerSecret, accessToken, accessSecret);
-            }
-            else
-            {
-                oAuth = new OAuth(consumerKey, consumerSecret, accessToken, accessSecret);
-            }
-
-            if (oAuth.User.Token != null)
-            {
-                List<string> blocks = new List<string>();
-                List<string> mutes = new List<string>();
-
-                UserIdsObject block = JsonConvert.DeserializeObject<UserIdsObject>(getBlockList("-1"));
-                while (true)
+                Console.WriteLine("Get My Mute List...");
+                result = JsonConvert.DeserializeObject<UserIdsObject>(TwitterApi.getMyMuteList("-1"));
+                while (result != null)
                 {
-                    blocks.AddRange(block.ids);
-                    if (block.next_cursor != 0)
-                        block = JsonConvert.DeserializeObject<UserIdsObject>(getBlockList(block.next_cursor_str));
+                    mutelist.UnionWith(result.ids);
+                    if (result.next_cursor != 0)
+                        result = JsonConvert.DeserializeObject<UserIdsObject>(TwitterApi.getMyMuteList(result.next_cursor_str));
                     else
                         break;
                 }
-
-                UserIdsObject mute = JsonConvert.DeserializeObject<UserIdsObject>(getMuteList("-1"));
-                while (true)
-                {
-                    mutes.AddRange(mute.ids);
-                    if (mute.next_cursor != 0)
-                        mute = JsonConvert.DeserializeObject<UserIdsObject>(getMuteList(mute.next_cursor_str));
-                    else
-                        break;
-                }
-
-                Console.WriteLine(string.Format("Total {0} block, {1} mute", blocks.Count, mutes.Count));
-
-                foreach (string s in blocks.ToArray())
-                {
-                    if (mutes.IndexOf(s) != -1)
-                    {
-                        blocks.Remove(s);
-                        mutes.Remove(s);
-                    }
-                }
-
-                Console.WriteLine(string.Format("Found {0} new block, {1} old mute", blocks.Count, mutes.Count));
-                Console.Write("Do you want continue sync mute? (Y/N) : ");
-                if (System.Console.ReadLine().ToUpper().Trim().Equals("Y"))
-                {
-                    foreach (string s in blocks)
-                    {
-                        Mute(s);
-                        System.Threading.Thread.Sleep(5000);
-                    }
-                }
-
-                Console.Write("Do you want continue unmute for unblocked user? (Y/N) : ");
-                if (System.Console.ReadLine().ToUpper().Trim().Equals("Y"))
-                {
-                    foreach (string s in mutes)
-                    {
-                        UnMute(s);
-                        System.Threading.Thread.Sleep(5000);
-                    }
-                }
-            }
-        }
-
-        public static string getBlockList(string cursor)
-        {
-            StringBuilder json = new StringBuilder();
-            
-            try
-            {
-                var req = oAuth.MakeRequest("GET", "https://api.twitter.com/1.1/blocks/ids.json?stringify_ids=true&cursor=" + cursor);
-
-                using (var res = req.GetResponse())
-                using (var reader = new StreamReader(res.GetResponseStream()))
-                {
-                    string str = reader.ReadToEnd();
-
-                    json.AppendLine(str);
-                    Console.WriteLine(str);
-                }
-            }
-            catch (WebException ex)
-            {
-                if (ex.Response != null)
-                {
-                    using (var res = ex.Response)
-                    using (var reader = new StreamReader(res.GetResponseStream()))
-                    {
-                        string str = reader.ReadToEnd();
-
-                        Console.WriteLine(str);
-                    }
-                }
-            }
-
-            return json.ToString();
-        }
-
-        public static string getMuteList(string cursor)
-        {
-            StringBuilder json = new StringBuilder();
-
-            try
-            {
-                var req = oAuth.MakeRequest("GET", "https://api.twitter.com/1.1/mutes/users/ids.json?cursor=" + cursor);
-
-                using (var res = req.GetResponse())
-                using (var reader = new StreamReader(res.GetResponseStream()))
-                {
-                    string str = reader.ReadToEnd();
-
-                    json.AppendLine(str);
-                    Console.WriteLine(str);
-                }
-            }
-            catch (WebException ex)
-            {
-                if (ex.Response != null)
-                {
-                    using (var res = ex.Response)
-                    using (var reader = new StreamReader(res.GetResponseStream()))
-                    {
-                        string str = reader.ReadToEnd();
-
-                        Console.WriteLine(str);
-                    }
-                }
-            }
-
-            return json.ToString();
-        }
-
-        public static void Mute(string id)
-        {
-            Console.Write("Mute user : " + id);
-            object obj = new { user_id = id };
-
-            try
-            {
-                var buff = Encoding.UTF8.GetBytes(OAuth.ToString(obj));
-
-                var req = oAuth.MakeRequest("POST", "https://api.twitter.com/1.1/mutes/users/create.json", obj);
-                req.GetRequestStream().Write(buff, 0, buff.Length);
-
-                using (var res = req.GetResponse())
-                using (var reader = new StreamReader(res.GetResponseStream()))
-                {
-                    string str = reader.ReadToEnd();
-                    Console.WriteLine(str);
-                }
-            }
-            catch (WebException ex)
-            {
-                if (ex.Response != null)
-                {
-                    using (var res = ex.Response)
-                    using (var reader = new StreamReader(res.GetResponseStream()))
-                    {
-                        string str = reader.ReadToEnd();
-                        Console.WriteLine(str);
-                    }
-                }
-            }
-        }
-
-        public static void UnMute(string id)
-        {
-            Console.Write("UnMute user : " + id);
-            object obj = new { user_id = id };
-
-            try
-            {
-                var buff = Encoding.UTF8.GetBytes(OAuth.ToString(obj));
-
-                var req = oAuth.MakeRequest("POST", "https://api.twitter.com/1.1/mutes/users/destroy.json", obj);
-                req.GetRequestStream().Write(buff, 0, buff.Length);
-
-                using (var res = req.GetResponse())
-                using (var reader = new StreamReader(res.GetResponseStream()))
-                {
-                    string str = reader.ReadToEnd();
-                    Console.WriteLine(str);
-                }
-            }
-            catch (WebException ex)
-            {
-                if (ex.Response != null)
-                {
-                    using (var res = ex.Response)
-                    using (var reader = new StreamReader(res.GetResponseStream()))
-                    {
-                        string str = reader.ReadToEnd();
-                        Console.WriteLine(str);
-                    }
-                }
-            }
-        }
-
-        public class UserIdsObject
-        {
-            public List<string> ids { get; set; }
-            public long next_cursor { get; set; }
-            public string next_cursor_str { get; set; }
-            public long previous_cursor { get; set; }
-            public string previous_cursor_str { get; set; }
-        }
-
-        public class OAuth
-        {
-            public class TokenPair
-            {
-                public TokenPair()
-                {
-                }
-                public TokenPair(string token, string secret)
-                {
-                    this.Token = token;
-                    this.Secret = secret;
-                }
-                public string Token { get; set; }
-                public string Secret { get; set; }
-            }
-
-            static OAuth()
-            {
-                ServicePointManager.Expect100Continue = false;
-            }
-
-            public OAuth(string appToken, string appSecret)
-                : this(appToken, appSecret, null, null)
-            {
-            }
-            public OAuth(string appToken, string appSecret, string userToken, string userSecret)
-            {
-                this.App = new TokenPair(appToken, appSecret);
-                this.User = new TokenPair(userToken, userSecret);
-            }
-
-            public TokenPair App { get; private set; }
-            public TokenPair User { get; private set; }
-
-            private static string[] oauth_array = { "oauth_consumer_key", "oauth_version", "oauth_nonce", "oauth_signature", "oauth_signature_method", "oauth_timestamp", "oauth_token", "oauth_callback" };
-
-            public WebRequest MakeRequest(string method, string url, object data = null)
-            {
-                method = method.ToUpper();
-                var uri = new Uri(url);
-                var dic = new SortedDictionary<string, object>();
-
-                if (!string.IsNullOrWhiteSpace(uri.Query))
-                    OAuth.AddDictionary(dic, uri.Query);
-
-                if (data != null)
-                    OAuth.AddDictionary(dic, data);
-
-                if (!string.IsNullOrWhiteSpace(this.User.Token))
-                    dic.Add("oauth_token", UrlEncode(this.User.Token));
-
-                dic.Add("oauth_consumer_key", UrlEncode(this.App.Token));
-                dic.Add("oauth_nonce", OAuth.GetNonce());
-                dic.Add("oauth_timestamp", OAuth.GetTimeStamp());
-                dic.Add("oauth_signature_method", "HMAC-SHA1");
-                dic.Add("oauth_version", "1.0");
-
-                var hashKey = string.Format(
-                    "{0}&{1}",
-                    UrlEncode(this.App.Secret),
-                    this.User.Secret == null ? null : UrlEncode(this.User.Secret));
-                var hashData = string.Format(
-                        "{0}&{1}&{2}",
-                        method.ToUpper(),
-                        UrlEncode(string.Format("{0}{1}{2}{3}", uri.Scheme, Uri.SchemeDelimiter, uri.Host, uri.AbsolutePath)),
-                        UrlEncode(OAuth.ToString(dic)));
-
-                using (var hash = new HMACSHA1(Encoding.UTF8.GetBytes(hashKey)))
-                    dic.Add("oauth_signature", UrlEncode(Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(hashData)))));
-
-                var sbData = new StringBuilder();
-                sbData.Append("OAuth ");
-                foreach (var st in dic)
-                    if (Array.IndexOf<string>(oauth_array, st.Key) >= 0)
-                        sbData.AppendFormat("{0}=\"{1}\",", st.Key, Convert.ToString(st.Value));
-                sbData.Remove(sbData.Length - 1, 1);
-
-                var str = sbData.ToString();
-
-                var req = (HttpWebRequest)WebRequest.Create(uri);
-                req.Method = method;
-                req.AutomaticDecompression = DecompressionMethods.Deflate | DecompressionMethods.GZip;
-                req.UserAgent = "Twitter Client";
-                req.Headers.Add("Authorization", sbData.ToString());
-
-                if (method == "POST")
-                    req.ContentType = "application/x-www-form-urlencoded";
-
-                return req;
-            }
-
-            private static string GetNonce()
-            {
-                return Guid.NewGuid().ToString("N");
-            }
-
-            private static DateTime GenerateTimeStampDateTime = new DateTime(1970, 1, 1, 0, 0, 0, 0);
-            private static string GetTimeStamp()
-            {
-                return Convert.ToInt64((DateTime.UtcNow - GenerateTimeStampDateTime).TotalSeconds).ToString();
-            }
-
-            private const string unreservedChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
-            private static string UrlEncode(string str)
-            {
-                var uriData = Uri.EscapeDataString(str);
-                var sb = new StringBuilder(uriData.Length);
-
-                for (int i = 0; i < uriData.Length; ++i)
-                {
-                    switch (uriData[i])
-                    {
-                        case '!': sb.Append("%21"); break;
-                        case '*': sb.Append("%2A"); break;
-                        case '\'': sb.Append("%5C"); break;
-                        case '(': sb.Append("%28"); break;
-                        case ')': sb.Append("%29"); break;
-                        default: sb.Append(uriData[i]); break;
-                    }
-                }
-
-                return sb.ToString();
-            }
-
-            private static string ToString(IDictionary<string, object> dic)
-            {
-                if (dic == null) return null;
-
-                var sb = new StringBuilder();
-
-                if (dic.Count > 0)
-                {
-                    foreach (var st in dic)
-                        if (st.Value is bool)
-                            sb.AppendFormat("{0}={1}&", st.Key, (bool)st.Value ? "true" : "false");
-                        else
-                            sb.AppendFormat("{0}={1}&", st.Key, Convert.ToString(st.Value));
-
-                    if (sb.Length > 0)
-                        sb.Remove(sb.Length - 1, 1);
-                }
-
-                return sb.ToString();
-            }
-
-            public static string ToString(object values)
-            {
-                if (values == null) return null;
-
-                var sb = new StringBuilder();
-
-                string name;
-                object value;
-
-                foreach (var p in values.GetType().GetProperties())
-                {
-                    if (!p.CanRead) continue;
-
-                    name = p.Name;
-                    value = p.GetValue(values, null);
-
-                    if (value is bool)
-                        sb.AppendFormat("{0}={1}&", name, (bool)value ? "true" : "false");
-                    else
-                        sb.AppendFormat("{0}={1}&", name, UrlEncode(Convert.ToString(value)));
-                }
-
-                if (sb.Length > 0)
-                    sb.Remove(sb.Length - 1, 1);
-
-                return sb.ToString();
-            }
-
-            private static void AddDictionary(IDictionary<string, object> dic, string query)
-            {
-                if (!string.IsNullOrWhiteSpace(query) || (query.Length > 1))
-                {
-                    int read = 0;
-                    int find = 0;
-
-                    if (query[0] == '?')
-                        read = 1;
-
-                    string key, val;
-
-                    while (read < query.Length)
-                    {
-                        find = query.IndexOf('=', read);
-                        key = query.Substring(read, find - read);
-                        read = find + 1;
-
-                        find = query.IndexOf('&', read);
-                        if (find > 0)
-                        {
-                            if (find - read == 1)
-                                val = null;
-                            else
-                                val = query.Substring(read, find - read);
-
-                            read = find + 1;
-                        }
-                        else
-                        {
-                            val = query.Substring(read);
-
-                            read = query.Length;
-                        }
-
-                        dic[key] = val;
-                    }
-                }
-            }
-
-            private static void AddDictionary(IDictionary<string, object> dic, object values)
-            {
-                object value;
-
-                foreach (var p in values.GetType().GetProperties())
-                {
-                    if (!p.CanRead) continue;
-                    value = p.GetValue(values, null);
-
-                    if (value is bool)
-                        dic[p.Name] = (bool)value ? "true" : "false";
-                    else
-                        dic[p.Name] = UrlEncode(Convert.ToString(value));
-
-
-                }
-            }
-
-            public TokenPair RequestToken()
-            {
-                try
-                {
-                    var req = MakeRequest("POST", "https://api.twitter.com/oauth/request_token");
-                    using (var res = req.GetResponse())
-                    using (var reader = new StreamReader(res.GetResponseStream()))
-                    {
-                        var str = reader.ReadToEnd();
-
-                        var token = new TokenPair();
-                        token.Token = Regex.Match(str, @"oauth_token=([^&]+)").Groups[1].Value;
-                        token.Secret = Regex.Match(str, @"oauth_token_secret=([^&]+)").Groups[1].Value;
-
-                        return token;
-                    }
-                }
-                catch
-                {
-                    return null;
-                }
-            }
-
-            public TokenPair AccessToken(string verifier)
-            {
-                try
-                {
-                    var obj = new { oauth_verifier = verifier };
-                    var buff = Encoding.UTF8.GetBytes(OAuth.ToString(obj));
-
-                    var req = MakeRequest("POST", "https://api.twitter.com/oauth/access_token", obj);
-                    req.GetRequestStream().Write(buff, 0, buff.Length);
-
-                    using (var res = req.GetResponse())
-                    using (var reader = new StreamReader(res.GetResponseStream()))
-                    {
-                        var str = reader.ReadToEnd();
-
-                        var token = new TokenPair();
-                        token.Token = Regex.Match(str, @"oauth_token=([^&]+)").Groups[1].Value;
-                        token.Secret = Regex.Match(str, @"oauth_token_secret=([^&]+)").Groups[1].Value;
-
-                        return token;
-                    }
-                }
-                catch
-                {
-                    return null;
-                }
-            }
-        }
-    }
-
-    public class Log
-    {
-        public static bool IsInited { get; private set; }
-        public static bool LogTrace { get; private set; }
-
-        public static void Init(bool LogTrace = false)
-        {
-            try
-            {
-                IsInited = true;
-                Trace.Listeners.Add(new TextWriterTraceListener(Console.Out));
-                Trace.AutoFlush = true;
-            }
-            catch
-            {
-                IsInited = false;
-            }
-        }
-
-        public static void Print(string tag, string message)
-        {
-            Console.ForegroundColor = ConsoleColor.White;
-            Output(tag, message);
-        }
-        public static void Http(string tag, string message)
-        {
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Output(tag, message);
-        }
-        public static void Debug(string tag, string message)
-        {
-            Console.ForegroundColor = ConsoleColor.Green;
-            Output(tag, message);
-        }
-        public static void Warning(string tag, string message)
-        {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Output(tag, message);
-        }
-        public static void Error(string tag, string message)
-        {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Output(tag, message);
-        }
-
-        private static void Output(string tag, string message)
-        {
-            string log = string.Format("{0} : {1}", tag, message);
-            if (IsInited)
-            {
-                Trace.WriteLine(log);
             }
             else
             {
-                Console.WriteLine(log);
+                Console.WriteLine("Failed to get your info!");
             }
-        }
 
-        public static void StackTrace()
-        {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            if (IsInited)
-            {
-                Trace.Write(new StackTrace(true));
-            }
-            else
-            {
-                Console.WriteLine(string.Format("Inflate stacktrace() : \n{0}", new StackTrace(true)));
-            }
-        }
+            Console.WriteLine($"Total {blocklist.Count} block, {mutelist.Count} mute");
 
-        public static void Indent()
-        {
-            if (!IsInited) return;
-            Trace.Indent();
-        }
+            blocklist.ExceptWith(mutelist);
 
-        public static void Unindent()
-        {
-            if (!IsInited) return;
-            Trace.Unindent();
-        }
-    }
-
-    public class INIParser
-    {
-        private string iniPath;
-        private IniData data;
-
-        public INIParser(string path)
-        {
-            this.iniPath = path;
-            if (File.Exists(iniPath))
-            {
-                data = new FileIniDataParser().ReadFile(iniPath);
-                string @out = string.Format("Read INI - [{0}]", iniPath);
-                foreach (var section in data.Sections)
+            Console.WriteLine($"Found {blocklist.Count} new blocks");
+            Console.Write("Do you want continue sync mute with block? (Y/N) : ");
+            readLine = Console.ReadLine();
+            if ((readLine != null) && readLine.ToUpper().Trim().Equals("Y"))
+                foreach (string s in blocklist)
                 {
-                    @out += string.Format("\n    [{0}]", section.SectionName);
-                    foreach (var key in section.Keys)
-                    {
-                        @out += string.Format("\n        {0} = {1}", key.KeyName, data[section.SectionName][key.KeyName]);
-                    }
+                    TwitterApi.Mute(s);
+                    Thread.Sleep(5000);
                 }
-                Log.Debug("INIParser", @out);
-            }
-            else
-            {
-                Log.Error("INIParser", string.Format("[{0}] is not correct directory. new inidata generated.", iniPath));
-                data = new IniData();
-            }
+
+
+            Console.Write("Do you want export your block list? (Y/N) : ");
+            readLine = Console.ReadLine();
+            if ((readLine != null) && readLine.ToUpper().Trim().Equals("Y"))
+                File.WriteAllText("blocklist_" + DateTime.Now.ToString("yyyy-MM-dd_HHmm") + ".csv", string.Join(",", blocklist));
         }
-
-        #region WINApi
-
-        //[DllImport( "kernel32.dll" )]
-        //private static extern int GetPrivateProfileString(
-        //	String section,
-        //	String key,
-        //	String def,
-        //	StringBuilder retVal,
-        //	int size,
-        //	String filePath );
-
-        //[DllImport( "kernel32.dll" )]
-        //private static extern long WritePrivateProfileString(
-        //	String section,
-        //	String key,
-        //	String val,
-        //	String filePath );
-
-        //public String GetValue( String Section, String Key )
-        //{
-        //	StringBuilder temp = new StringBuilder(255);
-        //	int i = GetPrivateProfileString(Section, Key, "", temp, 255, iniPath);
-        //	return temp.ToString( );
-        //}
-
-        //public void SetValue( String Section, String Key, String Value )
-        //{
-        //	WritePrivateProfileString( Section, Key, Value, iniPath );
-        //}
-
-        #endregion
-
-        public string GetValue(string Section, string Key)
-        {
-            try
-            {
-                return data[Section][Key];
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        public void SetValue(string Section, string Key, object Value)
-        {
-            if (!data.Sections.ContainsSection(Section)) data.Sections.AddSection(Section);
-            if (!data[Section].ContainsKey(Key)) data[Section].AddKey(Key);
-
-            data[Section][Key] = Value.ToString();
-        }
-
-        internal void Save()
-        {
-            new FileIniDataParser().WriteFile(iniPath, data, Encoding.UTF8);
-        }
-
-        #region FileIniDataParser
-
-
-
-        #endregion
     }
 }
